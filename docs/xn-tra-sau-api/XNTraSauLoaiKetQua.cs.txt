@@ -1,0 +1,23 @@
+using System.Globalization;
+
+namespace HV_api.Controllers;
+
+// Dùng chung cho controller xét nghiệm và controller mở rộng.
+// Nguồn mã loại: dmdichvu.maloaidichvu từ stored ThongTin trên HIS.
+public static class XNTraSauLoaiKetQua
+{
+    public static string? GetLoai(object? maLoaiDichVu)
+    {
+        if (!int.TryParse(Convert.ToString(maLoaiDichVu, CultureInfo.InvariantCulture),
+            NumberStyles.Integer, CultureInfo.InvariantCulture, out var maLoai))
+            return null;
+
+        return maLoai switch
+        {
+            8 or 9 or 10 or 11 or 33 or 34 or 41 => "XET_NGHIEM",
+            13 => "GPB",
+            42 or 12 => "KHANG_SINH_DO",
+            _ => null
+        };
+    }
+}

@@ -1,0 +1,496 @@
+using System.Data;
+using System.Globalization;
+using System.Security.Claims;
+using HV_api.Entities;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+
+namespace HV_api.Controllers;
+
+// Chép file này vào Controllers và đổi đuôi .cs.txt thành .cs.
+// Không thay thế hai controller xét nghiệm và chữ ký đang hoạt động.
+[ApiController]
+[Authorize]
+[Route("api/XNTraSau")]
+public sealed class XNTraSauMoRongController : ControllerBase
+{
+    private readonly NstlTestContext _db;
+    private readonly IConfiguration _configuration;
+    private readonly ILogger<XNTraSauMoRongController> _logger;
+
+    public XNTraSauMoRongController(NstlTestContext db,
+        IConfiguration configuration, ILogger<XNTraSauMoRongController> logger)
+    {
+        _db = db;
+        _configuration = configuration;
+        _logger = logger;
+    }
+
+    [HttpGet("{id:int}/cau-hinh-ket-qua")]
+    public Task<IActionResult> GetCauHinh(int id, CancellationToken cancellationToken)
+        => Run(id, async (connection, context, ct) =>
+        {
+            var forms = await GetForms(connection, context, ct);
+            var v2 = await UsesV2(connection, ct);
+            return Ok(new
+            {
+                success = true,
+                data = new
+                {
+                    id, mathanhtoanct = context.ChiTiet,
+                    mathanhtoan = context.ThanhToan, makcb = context.Makcb,
+                    mahh = context.Mahh, tenDichVu = context.TenDichVu,
+                    maLoaiDichVu = context.MaLoaiDichVu,
+                    danhSachMau = context.MauIn.Select(mau => new
+                    {
+                        idMauIn = mau,
+                        loaiKetQua = XNTraSauLoaiKetQua.GetLoai(context.MaLoaiDichVu),
+                        endpoint = GetEndpoint(id, XNTraSauLoaiKetQua.GetLoai(context.MaLoaiDichVu))
+                    }),
+                    suDungKetQuaKhacV2 = v2,
+                    // Danh sách form có dữ liệu của chỉ định này, chưa phải
+                    // danh sách các cặp form/mẫu in đã được kiểm tra mapping.
+                    danhSachForm = forms,
+                    endpointChuKy = $"/api/XNTraSau/{id}/chu-ky?kemAnh=true"
+                }
+            });
+        }, cancellationToken);
+
+    [HttpGet("{id:int}/ket-qua/gpb")]
+    public Task<IActionResult> GetGpb(int id,
+        [FromQuery] string? idMauIn = null,
+        [FromQuery] int? idMauKqKhac = null,
+        CancellationToken cancellationToken = default)
+        => Run(id, async (connection, context, ct) =>
+        {
+            var mau = SelectMau(context, idMauIn, "GPB");
+            if (!int.TryParse(mau, NumberStyles.None, CultureInfo.InvariantCulture,
+                out var mauInt) || mauInt <= 0)
+                throw Fail(422, "MAU_GPB_KHONG_HOP_LE", "Mẫu GPB phải là số nguyên dương.");
+
+            var v2 = await UsesV2(connection, ct);
+            var form = 0;
+            var forms = await GetForms(connection, context, ct);
+            if (idMauKqKhac is <= 0)
+                throw Fail(400, "FORM_KHONG_HOP_LE", "Bỏ trống idMauKqKhac hoặc nhập một mã form dương.");
+            if (v2)
+            {
+                if (idMauKqKhac.HasValue)
+                {
+                    if (!forms.Any(x => x.IdForm == idMauKqKhac.Value))
+                        throw Fail(400, "FORM_KHONG_THUOC_CHI_DINH",
+                            "Form này không có dữ liệu trong chỉ định đang chọn.", forms);
+                    form = idMauKqKhac.Value;
+                }
+                else if (forms.Count == 1) form = forms[0].IdForm;
+                else if (forms.Count > 1)
+                    throw Fail(409, "CAN_CHON_FORM", "Chỉ định có nhiều form, hãy chọn idMauKqKhac.", forms);
+                // Không có form: có thể là GPB chỉ có mô tả/kết luận.
+            }
+            else if (idMauKqKhac.HasValue)
+                throw Fail(400, "KHONG_SU_DUNG_FORM_V2",
+                    "HIS đang dùng kết quả khác phiên bản cũ; bỏ idMauKqKhac.");
+
+            // Tránh để stored tự chọn ngẫu nhiên khi có nhiều mẫu kết quả khác.
+            using var savedCommand = Text(connection, @"
+SELECT DISTINCT LTRIM(RTRIM(mauketquakhac)) AS mauketquakhac
+FROM dbo.mauintheodichvu
+WHERE mathanhtoanct = @ct AND LEN(LTRIM(RTRIM(mauketquakhac))) > 0;");
+            Add(savedCommand, "@ct", SqlDbType.BigInt, context.ChiTiet);
+            var savedTables = await ReadTables(savedCommand, ct);
+            var saved = savedTables[0].Rows;
+            if (saved.Count > 1)
+                throw Fail(409, "NHIEU_MAU_KET_QUA_KHAC",
+                    "Chỉ định có nhiều mauketquakhac. Cần đối chiếu cách HIS chọn mẫu trước khi trả kết quả.");
+            var mauKetQua = saved.Count == 0 ? "" : Str(saved[0], "mauketquakhac");
+            if (mauKetQua.Length > 200)
+                throw Fail(422, "MAU_KET_QUA_QUA_DAI", "mauketquakhac vượt quá 200 ký tự.");
+
+            await CheckFormMapping(connection,
+                v2 ? form.ToString(CultureInfo.InvariantCulture) : $"{context.Mahh}_{mauKetQua}", mau, ct);
+
+            // Quy ước của bản mẫu API: GPB phải đã ký HIS mới được phát hành.
+            // Không tự suy ra đã duyệt từ việc có ketluan hoặc có ảnh chữ ký.
+            using var signatureCommand = Proc(connection, "dbo.usp_App_XNTraSau_ChuKy");
+            Add(signatureCommand, "@mathanhtoanct", SqlDbType.BigInt, context.ChiTiet);
+            Add(signatureCommand, "@DocAnh", SqlDbType.Bit, false);
+            var signatureTables = await ReadTables(signatureCommand, ct);
+            Require(signatureTables, 1);
+            RequireColumns(signatureTables[0], "daKyHIS");
+            if (signatureTables[0].Rows.Count != 1 ||
+                !IsTrue(Value(signatureTables[0].Rows[0], "daKyHIS")))
+                throw Fail(409, "KET_QUA_CHUA_KY", "Kết quả GPB chưa được ký trên HIS.");
+
+            using var command = Proc(connection, "dbo.usp_App_XNTraSau_GPB");
+            Add(command, "@makcb", SqlDbType.NVarChar, context.Makcb, 20);
+            Add(command, "@mathanhtoan", SqlDbType.Int, context.ThanhToan);
+            Add(command, "@mahh", SqlDbType.Int, context.Mahh);
+            Add(command, "@mauketqua", SqlDbType.NVarChar, mauKetQua, 200);
+            // Mã nhân viên đăng nhập app chưa có mapping chắc chắn sang HIS.
+            // Không gán bừa một mã để làm tên người in.
+            Add(command, "@manvdangnhap_", SqlDbType.Int, null);
+            Add(command, "@mathanhtoanct", SqlDbType.BigInt, context.ChiTiet);
+            Add(command, "@laydendong", SqlDbType.Int, 0);
+            Add(command, "@NoiDungHinhAnhKhac", SqlDbType.NVarChar, "", 10);
+            Add(command, "@idmauin", SqlDbType.Int, mauInt);
+            Add(command, "@idmaukqk", SqlDbType.Int, form);
+            Add(command, "@fordesign", SqlDbType.Bit, false);
+
+            // Nếu bản clone đã thêm @DocHinhAnh, yêu cầu lấy ảnh mô bệnh học.
+            // Đây là ảnh nội dung kết quả, khác với ảnh chữ ký.
+            using (var parameterCommand = Text(connection, @"
+SELECT COUNT(*) FROM sys.parameters
+WHERE object_id = OBJECT_ID(N'dbo.usp_App_XNTraSau_GPB')
+AND name = N'@DocHinhAnh';"))
+            {
+                if (Convert.ToInt32(await parameterCommand.ExecuteScalarAsync(ct),
+                    CultureInfo.InvariantCulture) > 0)
+                    Add(command, "@DocHinhAnh", SqlDbType.Bit, true);
+            }
+
+            var tables = await ReadTables(command, ct);
+            // Giữ cả bảng rỗng để các bảng sau không bị lệch vị trí.
+            Require(tables, 10);
+            RequireColumns(tables[0], "makcb", "hoten");
+            RequireColumns(tables[1], "sophieu");
+            RequireColumns(tables[2], "mahh");
+            RequireColumns(tables[3], "ketluan", "daky");
+            RequireColumns(tables[4], "benhchinh");
+            RequireColumns(tables[7], "bslam");
+            RequireColumns(tables[8], "tennv");
+            RequireColumns(tables[9], "Anh");
+            CheckPatient(tables[0], context);
+            if (tables[2].Rows.Count == 0 || tables[2].Rows.Any(x => Number(x, "mahh") != context.Mahh))
+                throw Fail(502, "SAI_DICH_VU", "Stored trả dịch vụ không khớp chỉ định.");
+            if (tables[3].Rows.Count == 0)
+                throw Fail(404, "CHUA_CO_KET_QUA", "Chưa có kết quả GPB.");
+
+            // V2: trả name/value nguyên bản, không phụ thuộc hình dạng pivot.
+            // Không đọc form khác hoặc dữ liệu chỉ định khác.
+            var fields = new List<object>();
+            if (v2 && form > 0)
+            {
+                using var fieldCommand = Text(connection, @"
+SELECT name, value FROM dbo.cdhaketquakhac
+WHERE mathanhtoanct = @ct AND idform = @form ORDER BY name;");
+                Add(fieldCommand, "@ct", SqlDbType.BigInt, context.ChiTiet);
+                Add(fieldCommand, "@form", SqlDbType.Int, form);
+                var fieldTables = await ReadTables(fieldCommand, ct);
+                foreach (var row in fieldTables[0].Rows)
+                {
+                    var raw = Value(row, "value");
+                    var text = Convert.ToString(raw, CultureInfo.InvariantCulture);
+                    bool? boolean = bool.TryParse(text, out var b) ? b : null;
+                    fields.Add(new { name = Str(row, "name"), value = raw, giaTriBoolean = boolean });
+                }
+            }
+
+            return Ok(new
+            {
+                success = true,
+                data = new
+                {
+                    id, loaiKetQua = "GPB", mathanhtoanct = context.ChiTiet,
+                    mahh = context.Mahh, idMauIn = mau,
+                    idMauKqKhac = form == 0 ? (int?)null : form,
+                    suDungKetQuaKhacV2 = v2, daKyHIS = true,
+                    tenDichVu = context.TenDichVu,
+                    benhNhan = tables[0].Rows,
+                    chiDinh = Pick(tables[1], "tenphong", "ngay", "sophieu", "tendongnguyen",
+                        "tenkk", "tennv", "bschidinh", "bschidinhchucdanh", "tenkhoan",
+                        "khoadangnam", "sogiuong", "chieucao", "cannang"),
+                    // Mẫu 381 dùng ghichudv làm vị trí lấy mẫu.
+                    dichVu = Pick(tables[2], "ghichudv", "tendichvukemghichu"),
+                    ketQua = Pick(tables[3], "tennv", "ketluan", "mota", "docketqua", "ngayth",
+                        "ngaylam", "barcode", "Solam", "ngaytraKQ", "denghi", "maylam"),
+                    chanDoan = tables[4].Rows,
+                    truongKetQuaKhac = fields,
+                    // V2 dùng truongKetQuaKhac; bản cũ giữ các cột động từ stored.
+                    ketQuaKhacCu = v2 ? null : tables[5].Rows,
+                    nhanVien = Pick(tables[7], "bslam", "bslamchucdanh", "ktvlam",
+                        "ktvlamchucdanh", "bschidinhthuonggoi", "bslam2", "bskhac"),
+                    hinhAnh = tables[9].Rows
+                        .Select(x => Value(x, "Anh")).OfType<byte[]>()
+                        .Where(x => x.Length > 0)
+                        .Select(x => new { contentType = ImageType(x), anhBase64 = Convert.ToBase64String(x) }),
+                    endpointChuKy = $"/api/XNTraSau/{id}/chu-ky?kemAnh=true"
+                }
+            });
+        }, cancellationToken);
+
+    [HttpGet("{id:int}/ket-qua/khang-sinh-do")]
+    public Task<IActionResult> GetKhangSinhDo(int id,
+        [FromQuery] string? idMauIn = null,
+        CancellationToken cancellationToken = default)
+        => Run(id, async (connection, context, ct) =>
+        {
+            var mau = SelectMau(context, idMauIn, "KHANG_SINH_DO");
+            if (context.Barcode.Length > 50)
+                throw Fail(422, "BARCODE_QUA_DAI", "Barcode vượt quá 50 ký tự.");
+            using var command = Proc(connection, "dbo.usp_App_XNTraSau_KhangSinhDo");
+            Add(command, "@makcb", SqlDbType.NVarChar, context.Makcb, 20);
+            Add(command, "@barcode", SqlDbType.NVarChar, context.Barcode, 50);
+            Add(command, "@mathanhtoanct", SqlDbType.BigInt, context.ChiTiet);
+            Add(command, "@mathanhtoan", SqlDbType.Int, context.ThanhToan);
+            Add(command, "@mahh", SqlDbType.Int, context.Mahh);
+            Add(command, "@idmauin", SqlDbType.NVarChar, mau, 100);
+            var tables = await ReadTables(command, ct);
+            Require(tables, 5);
+            RequireColumns(tables[0], "vikhuanid", "mavikhuan", "khangsinhid",
+                "tenkhangsinh", "MIC", "SIR");
+            RequireColumns(tables[1], "fs", "description");
+            RequireColumns(tables[2], "makcb", "hoten");
+            RequireColumns(tables[3], "vikhuanid", "mavikhuan", "tenvikhuan", "daduyet", "ketluan");
+            RequireColumns(tables[4], "benhchinh");
+            CheckPatient(tables[2], context);
+            if (tables[3].Rows.Count == 0)
+                throw Fail(404, "CHUA_CO_KET_QUA", "Chưa có kết quả kháng sinh đồ.");
+            if (tables[3].Rows.Any(x => !IsTrue(Value(x, "daduyet"))))
+                throw Fail(409, "KET_QUA_CHUA_DUYET", "Kết quả kháng sinh đồ chưa được duyệt đầy đủ.");
+            // Không ghép các vi khuẩn chỉ theo tên, không tự tính lại S/I/R.
+            if (tables[0].Rows.Any(drug =>
+                !tables[3].Rows.Any(organism =>
+                    Str(drug, "vikhuanid") == Str(organism, "vikhuanid") &&
+                    Str(drug, "mavikhuan") == Str(organism, "mavikhuan"))))
+                throw Fail(502, "SAI_LIEN_KET_VI_KHUAN", "Dòng kháng sinh không khớp bảng vi khuẩn.");
+
+            return Ok(new
+            {
+                success = true,
+                data = new
+                {
+                    id, loaiKetQua = "KHANG_SINH_DO", mathanhtoanct = context.ChiTiet,
+                    mahh = context.Mahh, idMauIn = mau, tenDichVu = context.TenDichVu,
+                    benhNhan = tables[2].Rows,
+                    viKhuanVaChiDinh = tables[3].Rows,
+                    khangSinh = tables[0].Rows,
+                    soDongKhangSinh = tables[0].Rows.Count,
+                    chanDoan = tables[4].Rows,
+                    endpointChuKy = $"/api/XNTraSau/{id}/chu-ky?kemAnh=true"
+                }
+            });
+        }, cancellationToken);
+
+    private async Task<IActionResult> Run(int id,
+        Func<SqlConnection, Context, CancellationToken, Task<IActionResult>> action,
+        CancellationToken ct)
+    {
+        Response.Headers.CacheControl = "no-store";
+        if (string.IsNullOrWhiteSpace(User.FindFirst("manv")?.Value
+            ?? User.FindFirst(ClaimTypes.NameIdentifier)?.Value))
+            return Unauthorized(new { success = false, code = "CHUA_DANG_NHAP",
+                message = "Không xác định được nhân viên đăng nhập." });
+        try
+        {
+            var record = await _db.XntraSaus.AsNoTracking()
+                .Where(x => x.Id == id)
+                .Select(x => new { x.Mathanhtoanct, x.Makcb, x.Mahh, x.Barcode })
+                .SingleOrDefaultAsync(ct);
+            if (record is null)
+                throw Fail(404, "KHONG_CO_CHI_DINH", "Không tìm thấy bản ghi XNTraSau.");
+            if (record.Mathanhtoanct is null || record.Mahh is null ||
+                string.IsNullOrWhiteSpace(record.Makcb) || record.Makcb.Length > 20)
+                throw Fail(422, "THIEU_LIEN_KET_HIS", "Bản ghi thiếu hoặc sai khóa liên kết HIS.");
+            var cs = _configuration.GetConnectionString("HISDatabase");
+            if (string.IsNullOrWhiteSpace(cs))
+                throw Fail(503, "THIEU_KET_NOI_HIS", "Chưa cấu hình kết nối HISDatabase.");
+            await using var connection = new SqlConnection(cs);
+            await connection.OpenAsync(ct);
+            using var command = Proc(connection, "dbo.usp_App_XNTraSau_ThongTin");
+            Add(command, "@mathanhtoanct", SqlDbType.BigInt, record.Mathanhtoanct.Value);
+            Add(command, "@makcb", SqlDbType.NVarChar, record.Makcb, 20);
+            Add(command, "@mahh", SqlDbType.Int, record.Mahh.Value);
+            var tables = await ReadTables(command, ct);
+            Require(tables, 2);
+            RequireColumns(tables[0], "mathanhtoanct", "mathanhtoan", "makcb", "mahh",
+                "tendichvu", "maloaidichvu");
+            RequireColumns(tables[1], "idmauin");
+            if (tables[0].Rows.Count != 1)
+                throw Fail(422, "LIEN_KET_HIS_KHONG_DUY_NHAT", "Không xác định duy nhất chỉ định HIS.");
+            var row = tables[0].Rows[0];
+            if (Number(row, "mathanhtoanct") != record.Mathanhtoanct.Value ||
+                Number(row, "mahh") != record.Mahh.Value ||
+                !string.Equals(Str(row, "makcb"), record.Makcb.Trim(), StringComparison.OrdinalIgnoreCase))
+                throw Fail(502, "SAI_LIEN_KET_HIS", "Thông tin HIS không khớp bản ghi XNTraSau.");
+            var context = new Context(record.Mathanhtoanct.Value,
+                checked((int)Number(row, "mathanhtoan")), record.Mahh.Value,
+                record.Makcb.Trim(), record.Barcode?.Trim() ?? "", Str(row, "tendichvu"),
+                Value(row, "maloaidichvu"), tables[1].Rows.Select(x => Str(x, "idmauin"))
+                    .Where(x => x.Length > 0).Distinct(StringComparer.Ordinal).OrderBy(x => x).ToArray());
+            return await action(connection, context, ct);
+        }
+        catch (ApiFailure ex)
+        {
+            return StatusCode(ex.Status, new { success = false, code = ex.Code,
+                message = ex.Message, data = ex.Details });
+        }
+        catch (SqlException ex) when (ex.Number == 50000 || ex.Number is >= 51001 and <= 51009)
+        {
+            _logger.LogWarning(ex, "Stored từ chối XNTraSau {Id}, SQL {Number}", id, ex.Number);
+            return UnprocessableEntity(new { success = false, code = "HIS_TU_CHOI_DU_LIEU",
+                message = "HIS từ chối dữ liệu. Xem log API để biết stored và nguyên nhân.", sqlNumber = ex.Number });
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Lỗi lấy kết quả XNTraSau {Id}", id);
+            return StatusCode(500, new { success = false, code = "LOI_DOC_KET_QUA",
+                message = "Không đọc được kết quả. Kiểm tra log API." });
+        }
+    }
+
+    private static string? GetEndpoint(int id, string? loai) => loai switch
+    {
+        "XET_NGHIEM" => $"/api/XNTraSau/{id}/ket-qua/xet-nghiem",
+        "GPB" => $"/api/XNTraSau/{id}/ket-qua/gpb",
+        "KHANG_SINH_DO" => $"/api/XNTraSau/{id}/ket-qua/khang-sinh-do",
+        _ => null
+    };
+
+    private string SelectMau(Context context, string? requested, string expected)
+    {
+        if (context.MauIn.Length == 0)
+            throw Fail(422, "CHUA_CAU_HINH_MAU", "Dịch vụ chưa có mẫu in trên HIS.");
+        var mau = requested?.Trim();
+        if (string.IsNullOrEmpty(mau))
+        {
+            if (context.MauIn.Length > 1)
+                throw Fail(409, "CAN_CHON_MAU", "Hãy chọn idMauIn.", new { danhSachMau = context.MauIn });
+            mau = context.MauIn[0];
+        }
+        if (mau.Length > 100 || !context.MauIn.Contains(mau, StringComparer.Ordinal))
+            throw Fail(400, "MAU_KHONG_HOP_LE", "Mẫu không thuộc dịch vụ.", new { danhSachMau = context.MauIn });
+        var actual = XNTraSauLoaiKetQua.GetLoai(context.MaLoaiDichVu);
+        if (actual is null)
+            throw Fail(422, "LOAI_DICH_VU_CHUA_HO_TRO",
+                "Mã loại dịch vụ HIS bị thiếu hoặc chưa được hỗ trợ.",
+                new { maLoaiDichVu = context.MaLoaiDichVu });
+        if (actual != expected)
+            throw Fail(400, "SAI_LOAI_KET_QUA", "Mẫu này phải gọi endpoint của loại kết quả khác.", new { loaiKetQua = actual });
+        return mau;
+    }
+
+    private static async Task<bool> UsesV2(SqlConnection connection, CancellationToken ct)
+    {
+        using var command = Text(connection, @"
+SELECT giatri FROM dbo.thietlaphethong WHERE mathietlap = N'iSudungLapKQKhacV2';");
+        var tables = await ReadTables(command, ct);
+        if (tables[0].Rows.Count > 1)
+            throw Fail(409, "TRUNG_CAU_HINH_V2", "Có nhiều dòng cấu hình iSudungLapKQKhacV2.");
+        return tables[0].Rows.Count == 1 && IsTrue(Value(tables[0].Rows[0], "giatri"));
+    }
+
+    private static async Task<List<FormInfo>> GetForms(SqlConnection connection, Context context, CancellationToken ct)
+    {
+        using var command = Text(connection, @"
+SELECT idform, COUNT(*) AS soTruong FROM dbo.cdhaketquakhac
+WHERE mathanhtoanct = @ct AND idform > 0 GROUP BY idform ORDER BY idform;");
+        Add(command, "@ct", SqlDbType.BigInt, context.ChiTiet);
+        var tables = await ReadTables(command, ct);
+        return tables[0].Rows.Select(x => new FormInfo(checked((int)Number(x, "idform")),
+            checked((int)Number(x, "soTruong")))).ToList();
+    }
+
+    private static async Task CheckFormMapping(SqlConnection connection, string key, string mau, CancellationToken ct)
+    {
+        using var command = Text(connection, @"
+SELECT DISTINCT LTRIM(RTRIM(CONVERT(NVARCHAR(100), idmauin))) AS idmauin
+FROM dbo.cauhinh_mapmauintheomaukhac
+WHERE LTRIM(RTRIM(CONVERT(NVARCHAR(200), mauketqua))) = @key;");
+        Add(command, "@key", SqlDbType.NVarChar, key, 200);
+        var tables = await ReadTables(command, ct);
+        var mapped = tables[0].Rows.Select(x => Str(x, "idmauin")).ToArray();
+        if (mapped.Length > 0 && !mapped.Contains(mau, StringComparer.Ordinal))
+            throw Fail(400, "FORM_KHONG_KHOP_MAU_IN",
+                "Form kết quả khác không được HIS ánh xạ với mẫu in này.", new { danhSachMau = mapped });
+        // Không có mapping: giữ hành vi của stored gốc, vẫn kiểm tra mẫu thuộc dmdichvu.
+    }
+
+    private static SqlCommand Proc(SqlConnection c, string name)
+        => new(name, c) { CommandType = CommandType.StoredProcedure, CommandTimeout = 60 };
+    private static SqlCommand Text(SqlConnection c, string sql)
+        => new(sql, c) { CommandTimeout = 30 };
+    private static void Add(SqlCommand command, string name, SqlDbType type, object? value, int size = 0)
+    {
+        var parameter = size == 0 ? command.Parameters.Add(name, type) : command.Parameters.Add(name, type, size);
+        parameter.Value = value ?? DBNull.Value;
+    }
+
+    private static async Task<List<TableData>> ReadTables(SqlCommand command, CancellationToken ct)
+    {
+        var tables = new List<TableData>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        do
+        {
+            if (reader.FieldCount == 0) continue;
+            var columns = Enumerable.Range(0, reader.FieldCount).Select(reader.GetName).ToArray();
+            if (columns.Distinct(StringComparer.OrdinalIgnoreCase).Count() != columns.Length)
+                throw Fail(502, "TRUNG_TEN_COT", "Stored trả cột trùng tên; cần đặt alias trước khi dùng API.");
+            var rows = new List<Dictionary<string, object?>>();
+            while (await reader.ReadAsync(ct))
+            {
+                var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                for (var i = 0; i < reader.FieldCount; i++)
+                    row.Add(columns[i], reader.IsDBNull(i) ? null : reader.GetValue(i));
+                rows.Add(row);
+            }
+            tables.Add(new TableData(columns, rows));
+        } while (await reader.NextResultAsync(ct));
+        return tables;
+    }
+
+    private static void Require(List<TableData> tables, int count)
+    {
+        if (tables.Count != count)
+            throw Fail(502, "SAI_CAU_TRUC_STORED", $"Cần {count} bảng kết quả, thực tế có {tables.Count}.");
+    }
+    private static void RequireColumns(TableData table, params string[] columns)
+    {
+        var missing = columns.Where(x => !table.Columns.Contains(x, StringComparer.OrdinalIgnoreCase)).ToArray();
+        if (missing.Length > 0)
+            throw Fail(502, "THIEU_COT_STORED", "Stored thiếu cột cần thiết.", new { missing });
+    }
+    private static void CheckPatient(TableData table, Context context)
+    {
+        if (table.Rows.Count == 0 || table.Rows.Any(x =>
+            !string.Equals(Str(x, "makcb"), context.Makcb, StringComparison.OrdinalIgnoreCase)))
+            throw Fail(502, "SAI_BENH_NHAN", "Bảng bệnh nhân rỗng hoặc không khớp chỉ định.");
+    }
+    private static List<Dictionary<string, object?>> Pick(TableData table, params string[] columns)
+        => table.Rows.Select(row => columns.Where(row.ContainsKey)
+            .ToDictionary(x => x, x => row[x], StringComparer.OrdinalIgnoreCase)).ToList();
+    private static object? Value(Dictionary<string, object?> row, string column)
+        => row.TryGetValue(column, out var value) ? value : null;
+    private static string Str(Dictionary<string, object?> row, string column)
+        => Convert.ToString(Value(row, column), CultureInfo.InvariantCulture)?.Trim() ?? "";
+    private static long Number(Dictionary<string, object?> row, string column)
+        => Value(row, column) is { } value ? Convert.ToInt64(value, CultureInfo.InvariantCulture)
+            : throw Fail(502, "THIEU_GIA_TRI_KHOA", $"Thiếu giá trị {column}.");
+    private static bool IsTrue(object? value)
+    {
+        var text = Convert.ToString(value, CultureInfo.InvariantCulture)?.Trim();
+        return text == "1" || string.Equals(text, "true", StringComparison.OrdinalIgnoreCase);
+    }
+    private static string ImageType(byte[] bytes)
+    {
+        if (bytes.Length >= 8 && bytes.AsSpan(0, 8).SequenceEqual(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 })) return "image/png";
+        if (bytes.Length >= 3 && bytes[0] == 255 && bytes[1] == 216 && bytes[2] == 255) return "image/jpeg";
+        if (bytes.Length >= 2 && bytes[0] == 66 && bytes[1] == 77) return "image/bmp";
+        return "application/octet-stream";
+    }
+    private static ApiFailure Fail(int status, string code, string message, object? details = null)
+        => new(status, code, message, details);
+    private sealed class ApiFailure(int status, string code, string message, object? details) : Exception(message)
+    {
+        public int Status { get; } = status;
+        public string Code { get; } = code;
+        public object? Details { get; } = details;
+    }
+    private sealed record Context(long ChiTiet, int ThanhToan, int Mahh, string Makcb,
+        string Barcode, string TenDichVu, object? MaLoaiDichVu, string[] MauIn);
+    private sealed record FormInfo(int IdForm, int SoTruong);
+    private sealed record TableData(string[] Columns, List<Dictionary<string, object?>> Rows);
+}

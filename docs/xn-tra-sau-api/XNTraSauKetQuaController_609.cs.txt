@@ -1,0 +1,617 @@
+﻿using System.Data;
+using System.Globalization;
+using System.Security.Claims;
+using HV_api.Entities;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
+
+namespace HV_api.Controllers;
+
+[ApiController]
+[Authorize]
+[Route("api/XNTraSau")]
+public sealed class XNTraSauKetQuaController : ControllerBase
+{
+    private readonly NstlTestContext _db;
+    private readonly IConfiguration _configuration;
+    private readonly ILogger<XNTraSauKetQuaController> _logger;
+
+    public XNTraSauKetQuaController(
+        NstlTestContext db,
+        IConfiguration configuration,
+        ILogger<XNTraSauKetQuaController> logger)
+    {
+        _db = db;
+        _configuration = configuration;
+        _logger = logger;
+    }
+
+    [HttpGet("{id:int}/ket-qua/xet-nghiem")]
+    public async Task<IActionResult> GetXetNghiem(
+        int id,
+        [FromQuery] string? idMauIn = null,
+        CancellationToken cancellationToken = default)
+    {
+        Response.Headers.CacheControl = "no-store";
+
+        var manvDangNhap =
+            User.FindFirst("manv")?.Value
+            ?? User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+
+        if (string.IsNullOrWhiteSpace(manvDangNhap))
+        {
+            return Unauthorized(new
+            {
+                success = false,
+                message = "Không xác định được nhân viên đăng nhập."
+            });
+        }
+
+        try
+        {
+            // 1. Lấy thông tin từ bản ghi XNTraSau.
+            var record = await _db.XntraSaus
+                .AsNoTracking()
+                .Where(x => x.Id == id)
+                .Select(x => new
+                {
+                    x.Id,
+                    x.Mathanhtoanct,
+                    x.Makcb,
+                    x.Mahh,
+                    x.Hoten,
+                    x.Namsinh,
+                    x.Gioitinh,
+                    x.Tenhh
+                })
+                .SingleOrDefaultAsync(cancellationToken);
+
+            if (record is null)
+            {
+                return NotFound(new
+                {
+                    success = false,
+                    code = "XNTraSau_NOT_FOUND",
+                    message = "Không tìm thấy bản ghi XNTraSau."
+                });
+            }
+
+            if (record.Mathanhtoanct is null
+                || record.Mahh is null
+                || string.IsNullOrWhiteSpace(record.Makcb))
+            {
+                return UnprocessableEntity(new
+                {
+                    success = false,
+                    code = "THIEU_THONG_TIN_CHI_DINH",
+                    message =
+                        "Bản ghi thiếu mã thanh toán chi tiết, mã KCB hoặc mã dịch vụ."
+                });
+            }
+
+            // Stored xét nghiệm đang nhận makcb NVARCHAR(15).
+            if (record.Makcb.Length > 15)
+            {
+                return UnprocessableEntity(new
+                {
+                    success = false,
+                    code = "MA_KCB_QUA_DAI",
+                    message =
+                        "Mã KCB vượt độ dài tham số của stored xét nghiệm."
+                });
+            }
+
+            long mathanhtoanct = record.Mathanhtoanct.Value;
+            int mahh = record.Mahh.Value;
+
+            var connectionString =
+                _configuration.GetConnectionString("HISDatabase");
+
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                throw new InvalidOperationException(
+                    "Thiếu ConnectionStrings:HISDatabase.");
+            }
+
+            await using var connection =
+                new SqlConnection(connectionString);
+
+            await connection.OpenAsync(cancellationToken);
+
+            // 2. Đối chiếu chỉ định và lấy danh sách mẫu từ HIS.
+            var danhSachMau =
+                new SortedSet<string>(StringComparer.Ordinal);
+            object? maLoaiDichVu = null;
+            using (var command = new SqlCommand(
+                "dbo.usp_App_XNTraSau_ThongTin",
+                connection))
+            {
+                command.CommandType = CommandType.StoredProcedure;
+                command.CommandTimeout = 30;
+
+                command.Parameters.Add(
+                    "@mathanhtoanct", SqlDbType.BigInt
+                ).Value = mathanhtoanct;
+
+                command.Parameters.Add(
+                    "@makcb", SqlDbType.NVarChar, 20
+                ).Value = record.Makcb;
+
+                command.Parameters.Add(
+                    "@mahh", SqlDbType.Int
+                ).Value = mahh;
+
+                await using var reader =
+                    await command.ExecuteReaderAsync(cancellationToken);
+
+                if (!await reader.ReadAsync(cancellationToken))
+                {
+                    throw new InvalidOperationException(
+                        "Stored ThongTin không trả thông tin chỉ định.");
+                }
+                maLoaiDichVu = reader["maloaidichvu"] == DBNull.Value
+                ? null
+                : reader["maloaidichvu"];
+                // Bảng thứ hai chứa cột idmauin.
+                if (!await reader.NextResultAsync(cancellationToken))
+                {
+                    throw new InvalidOperationException(
+                        "Stored ThongTin không trả bảng danh sách mẫu.");
+                }
+
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    var value = reader["idmauin"] == DBNull.Value
+                        ? null
+                        : reader["idmauin"].ToString()?.Trim();
+
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        danhSachMau.Add(value);
+                    }
+                }
+
+                // Đọc đến cuối để không bỏ sót lỗi phát sinh sau SELECT.
+                while (await reader.NextResultAsync(cancellationToken))
+                {
+                }
+            }
+
+            if (danhSachMau.Count == 0)
+            {
+                return UnprocessableEntity(new
+                {
+                    success = false,
+                    code = "CHUA_CAU_HINH_MAU",
+                    message = "Dịch vụ chưa có mẫu kết quả trong danh mục HIS."
+                });
+            }
+
+            idMauIn = idMauIn?.Trim();
+
+            if (string.IsNullOrWhiteSpace(idMauIn))
+            {
+                if (danhSachMau.Count == 1)
+                {
+                    idMauIn = danhSachMau.Single();
+                }
+                else
+                {
+                    return Conflict(new
+                    {
+                        success = false,
+                        code = "CAN_CHON_MAU",
+                        message =
+                            "Dịch vụ có nhiều mẫu. Hãy truyền idMauIn phù hợp.",
+                        data = new
+                        {
+                            danhSachMau = danhSachMau.ToArray()
+                        }
+                    });
+                }
+            }
+
+            if (idMauIn.Length > 50 || !danhSachMau.Contains(idMauIn))
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    code = "MAU_KHONG_HOP_LE",
+                    message = "Mẫu được chọn không thuộc cấu hình của dịch vụ.",
+                    data = new
+                    {
+                        danhSachMau = danhSachMau.ToArray()
+                    }
+                });
+            }
+            var loaiKetQua = XNTraSauLoaiKetQua.GetLoai(maLoaiDichVu);
+
+            if (loaiKetQua is null)
+            {
+                return UnprocessableEntity(new
+                {
+                    success = false,
+                    code = "LOAI_DICH_VU_CHUA_HO_TRO",
+                    message = "Mã loại dịch vụ HIS bị thiếu hoặc chưa được hỗ trợ.",
+                    data = new { maLoaiDichVu }
+                });
+            }
+
+            if (loaiKetQua != "XET_NGHIEM")
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    code = "SAI_LOAI_KET_QUA",
+                    message = "Mẫu này không thuộc API kết quả xét nghiệm.",
+                    data = new { maLoaiDichVu, loaiKetQua }
+                });
+            }
+            // 3. Gọi stored xét nghiệm.
+            var dongKetQua = new List<Dictionary<string, object?>>();
+            var thongTin = new List<Dictionary<string, object?>>();
+            var chanDoan = new List<Dictionary<string, object?>>();
+            var ghiChu = new List<Dictionary<string, object?>>();
+            var hinhAnh = new List<Dictionary<string, object?>>();
+
+            bool daTimThayBangKetQua = false;
+            bool daTimThayBangThongTin = false;
+            bool daTimThayBangChanDoan = false;
+            bool daTimThayBangGhiChu = false;
+            bool daTimThayBangHinhAnh = false;
+
+            using (var command = new SqlCommand(
+                "dbo.usp_App_XNTraSau_XetNghiem_Phieu",
+                connection))
+            {
+                command.CommandType = CommandType.StoredProcedure;
+                // Stored bao gọi lần lượt ND và TDT; trên dữ liệu thực tế mẫu
+                // 609 có thể cần gần 40 giây.
+                command.CommandTimeout = 180;
+
+                command.Parameters.Add(
+                    "@makcb", SqlDbType.NVarChar, 15
+                ).Value = record.Makcb;
+
+                command.Parameters.Add(
+                    "@barcode", SqlDbType.NVarChar, 50
+                ).Value = string.Empty;
+
+                command.Parameters.Add(
+                    "@ChuoiMahh", SqlDbType.NVarChar, -1
+                ).Value = string.Empty;
+
+                command.Parameters.Add(
+                    "@idmauin", SqlDbType.NVarChar, 50
+                ).Value = idMauIn;
+
+                command.Parameters.Add(
+                    "@mathanhtoanct", SqlDbType.NVarChar, -1
+                ).Value =
+                    mathanhtoanct.ToString(CultureInfo.InvariantCulture);
+
+                command.Parameters.Add(
+                    "@InTuLichSuCLS", SqlDbType.Bit
+                ).Value = false;
+
+                await using var reader =
+                    await command.ExecuteReaderAsync(cancellationToken);
+
+                do
+                {
+                    if (reader.FieldCount == 0)
+                    {
+                        continue;
+                    }
+
+                    var columnNames = Enumerable.Range(0, reader.FieldCount)
+                        .Select(reader.GetName)
+                        .ToArray();
+
+                    var columns = columnNames
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                    if (columns.Count != columnNames.Length)
+                    {
+                        throw new InvalidOperationException(
+                            "Stored xét nghiệm trả cột trùng tên.");
+                    }
+
+                    List<Dictionary<string, object?>>? bangDich = null;
+
+                    if (columns.Contains("machiso")
+                        && columns.Contains("ketluan"))
+                    {
+                        if (daTimThayBangKetQua)
+                        {
+                            throw new InvalidOperationException(
+                                "Stored trả nhiều bảng chỉ số ngoài cấu trúc dự kiến.");
+                        }
+
+                        string[] requiredColumns = idMauIn == "301"
+                            ?
+                            [
+                                "tenchiso",
+                                "daduyet",
+                                "grouplevel",
+                                "mathanhtoanct",
+                                "mahh"
+                            ]
+                            :
+                            [
+                                "tenchiso_goc",
+                                "ketqua_goc",
+                                "daduyet",
+                                "grouplevel",
+                                "mathanhtoanct",
+                                "mahh"
+                            ];
+
+                        if (requiredColumns.Any(x => !columns.Contains(x)))
+                        {
+                            throw new InvalidOperationException(
+                                "Stored xét nghiệm thiếu cột đầu ra cần thiết.");
+                        }
+
+                        daTimThayBangKetQua = true;
+                        bangDich = dongKetQua;
+                    }
+                    else if (columns.Contains("makcb")
+                             && columns.Contains("hoten")
+                             && columns.Contains("barcode"))
+                    {
+                        if (daTimThayBangThongTin)
+                        {
+                            throw new InvalidOperationException(
+                                "Stored trả nhiều bảng thông tin hành chính.");
+                        }
+
+                        daTimThayBangThongTin = true;
+                        bangDich = thongTin;
+                    }
+                    else if (columns.Contains("tenbenh"))
+                    {
+                        if (daTimThayBangChanDoan)
+                        {
+                            throw new InvalidOperationException(
+                                "Stored trả nhiều bảng chẩn đoán.");
+                        }
+
+                        daTimThayBangChanDoan = true;
+                        bangDich = chanDoan;
+                    }
+                    else if (columns.Contains("ghichudichvu")
+                             && columns.Contains("ghichubarcode"))
+                    {
+                        if (daTimThayBangGhiChu)
+                        {
+                            throw new InvalidOperationException(
+                                "Stored trả nhiều bảng ghi chú.");
+                        }
+
+                        daTimThayBangGhiChu = true;
+                        bangDich = ghiChu;
+                    }
+                    else if (columns.Contains("anh")
+                             && columns.Contains("contenttype")
+                             && columns.Contains("sobyte"))
+                    {
+                        if (daTimThayBangHinhAnh)
+                        {
+                            throw new InvalidOperationException(
+                                "Stored trả nhiều bảng ảnh kết quả.");
+                        }
+
+                        daTimThayBangHinhAnh = true;
+                        bangDich = hinhAnh;
+                    }
+
+                    if (bangDich is null)
+                    {
+                        continue;
+                    }
+
+                    while (await reader.ReadAsync(cancellationToken))
+                    {
+                        var row = new Dictionary<string, object?>(
+                            StringComparer.OrdinalIgnoreCase);
+
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            row.Add(
+                                columnNames[i],
+                                reader.IsDBNull(i)
+                                    ? null
+                                    : reader.GetValue(i));
+                        }
+
+                        bangDich.Add(row);
+                    }
+                }
+                while (await reader.NextResultAsync(cancellationToken));
+            }
+
+            if (!daTimThayBangKetQua
+                || !daTimThayBangThongTin
+                || !daTimThayBangChanDoan
+                || !daTimThayBangGhiChu)
+            {
+                throw new InvalidOperationException(
+                    "Stored xét nghiệm phải trả đủ 4 bảng: "
+                    + "dongKetQua, thongTin, chanDoan và ghiChu.");
+            }
+
+            if (thongTin.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    "Stored xét nghiệm không trả thông tin hành chính.");
+            }
+
+            // Dòng grouplevel = 0 là dòng dữ liệu.
+            // Các dòng nhóm vẫn được giữ lại để Flutter hiển thị.
+            var dongDuLieu = dongKetQua
+                .Where(x => Convert.ToInt32(
+                    x["grouplevel"],
+                    CultureInfo.InvariantCulture) == 0)
+                .ToList();
+
+            if (dongDuLieu.Count == 0)
+            {
+                return NotFound(new
+                {
+                    success = false,
+                    code = "CHUA_CO_KET_QUA",
+                    message = "Stored chưa trả dòng kết quả xét nghiệm."
+                });
+            }
+
+            // Kiểm tra stored không trả dữ liệu ngoài chỉ định đã chọn.
+            if (dongDuLieu.Any(x =>
+                Convert.ToInt64(
+                    x["mathanhtoanct"],
+                    CultureInfo.InvariantCulture) != mathanhtoanct
+                || Convert.ToInt32(
+                    x["mahh"],
+                    CultureInfo.InvariantCulture) != mahh))
+            {
+                throw new InvalidOperationException(
+                    "Kết quả trả về không khớp chỉ định đang xem.");
+            }
+
+            // Endpoint này chỉ công bố phiếu khi các dòng dữ liệu đã duyệt.
+            if (dongDuLieu.Any(x => Convert.ToInt32(
+                x["daduyet"],
+                CultureInfo.InvariantCulture) <= 0))
+            {
+                return Conflict(new
+                {
+                    success = false,
+                    code = "KET_QUA_CHUA_DUYET",
+                    message = "Phiếu còn dòng kết quả chưa được duyệt trên HIS."
+                });
+            }
+
+            var hinhAnhTraVe = hinhAnh
+                .Select(x => new
+                {
+                    contentType = Convert.ToString(
+                        x["contentType"],
+                        CultureInfo.InvariantCulture),
+                    soByte = Convert.ToInt32(
+                        x["soByte"],
+                        CultureInfo.InvariantCulture),
+                    anhBase64 = x["Anh"] is byte[] bytes
+                        ? Convert.ToBase64String(bytes)
+                        : null
+                })
+                .ToList();
+
+            return Ok(new
+            {
+                success = true,
+                data = new
+                {
+                    id = record.Id,
+                    loaiKetQua = "XET_NGHIEM",
+                    mathanhtoanct,
+                    mahh,
+                    idMauIn,
+                    tenDichVu = record.Tenhh,
+                    benhNhan = new
+                    {
+                        makcb = record.Makcb,
+                        hoten = record.Hoten,
+                        namsinh = record.Namsinh,
+                        gioitinh = record.Gioitinh
+                    },
+                    soDongDuLieu = dongDuLieu.Count,
+                    dongKetQua,
+                    thongTin,
+                    chanDoan,
+                    ghiChu,
+                    hinhAnh = hinhAnhTraVe,
+                    endpointChuKy =
+                        $"/api/XNTraSau/{id}/chu-ky?kemAnh=true"
+                }
+            });
+        }
+        catch (OperationCanceledException ex)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogInformation(
+                ex,
+                "Client đã hủy yêu cầu kết quả xét nghiệm XNTraSau {Id}.",
+                id);
+
+            return StatusCode(499, new
+            {
+                success = false,
+                code = "YEU_CAU_DA_HUY",
+                message = "Yêu cầu đã bị hủy trước khi HIS trả xong dữ liệu."
+            });
+        }
+        catch (SqlException ex) when (ex.Number == -2)
+        {
+            _logger.LogWarning(
+                ex,
+                "HIS quá thời gian lấy kết quả xét nghiệm XNTraSau {Id}.",
+                id);
+
+            return StatusCode(504, new
+            {
+                success = false,
+                code = "HIS_QUA_THOI_GIAN",
+                message = "HIS xử lý kết quả quá thời gian cho phép. Vui lòng thử lại."
+            });
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogError(
+                ex,
+                "Sai cấu trúc stored xét nghiệm XNTraSau {Id}.",
+                id);
+
+            return StatusCode(502, new
+            {
+                success = false,
+                code = "SAI_CAU_TRUC_STORED",
+                message = ex.Message
+            });
+        }
+        catch (SqlException ex) when (
+            ex.Number == 50000
+            || (ex.Number >= 51001 && ex.Number <= 51009))
+        {
+            _logger.LogWarning(
+                ex,
+                "HIS từ chối lấy kết quả xét nghiệm XNTraSau {Id}.",
+                id);
+
+            return UnprocessableEntity(new
+            {
+                success = false,
+                code = "HIS_KHONG_TRA_KET_QUA",
+                message =
+                    "HIS chưa trả được kết quả với chỉ định và mẫu đã chọn. "
+                    + "Xem log API để biết lỗi từ stored."
+            });
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(
+                ex,
+                "Lỗi lấy kết quả xét nghiệm XNTraSau {Id}.",
+                id);
+
+            return StatusCode(500, new
+            {
+                success = false,
+                code = "LOI_LAY_KET_QUA",
+                message =
+                    "Không lấy được kết quả xét nghiệm. Kiểm tra log API."
+            });
+        }
+    }
+}
